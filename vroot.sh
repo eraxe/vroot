@@ -3,11 +3,11 @@
 # -----------------------------------------------------------------------------
 # Script Name: vroot.sh
 # Description: Enhanced command-line tool to manage Podman AlmaLinux containers with
-#              LiteSpeed. Supports creating, entering, listing, removing containers,
+#              OpenLiteSpeed. Supports creating, entering, listing, removing containers,
 #              managing systemd services, backup & restore, and more.
 # Author: Arash Abolhasani 
 # Date: 2024-10-17
-# Version: 3.3.0
+# Version: 3.4.0
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -20,7 +20,6 @@ DEFAULT_PORT=60000
 DEFAULT_ALIAS="vroot"
 DEFAULT_DATA_DIR="$(pwd)/containers_data"
 DEFAULT_PACKAGE_GROUP="base"
-LITESPEED_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/litespeedtech/lsws/master/install.sh"
 CONFIG_FILE="$HOME/.vroot_config"
 
 # Additional packages to install by default
@@ -30,11 +29,11 @@ DEFAULT_PACKAGES=("git" "vim" "curl")
 DEFAULT_CPU="1"
 DEFAULT_MEMORY="512m"
 
-# Colors for echo functions
-COLOR_INFO="\e[34m[INFO]\e[0m"
-COLOR_SUCCESS="\e[32m[SUCCESS]\e[0m"
-COLOR_WARNING="\e[33m[WARNING]\e[0m"
-COLOR_ERROR="\e[31m[ERROR]\e[0m"
+# Colors for echo functions (removed for UI enhancement)
+COLOR_INFO="[INFO]"
+COLOR_SUCCESS="[SUCCESS]"
+COLOR_WARNING="[WARNING]"
+COLOR_ERROR="[ERROR]"
 
 # ------------------------------- Functions ------------------------------------
 
@@ -61,7 +60,7 @@ echo_error() {
 # Function to display help
 display_help() {
     cat << HELP
-vroot - Manage Podman AlmaLinux containers with LiteSpeed
+vroot - Manage Podman AlmaLinux containers with OpenLiteSpeed
 
 Usage:
   vroot <command> [options]
@@ -239,7 +238,7 @@ HELP
 
 # Function to check dependencies
 check_dependencies() {
-    local dependencies=(podman dialog lsof systemctl wget tar gcc make openssl)
+    local dependencies=(podman dialog lsof systemctl wget tar gcc make openssl firewall-cmd)
     local missing=()
 
     for cmd in "${dependencies[@]}"; do
@@ -333,7 +332,7 @@ podman_container_exists() {
     fi
 }
 
-# Function to create a Podman container with LiteSpeed and default packages
+# Function to create a Podman container with OpenLiteSpeed and default packages
 create_container() {
     local BASE_IMAGE="$1"
     local HOST_PORT="$2"
@@ -400,9 +399,9 @@ create_container() {
 
     echo_success "Container $CONTAINER_NAME created and started on host port $HOST_PORT."
 
-    # Install LiteSpeed and default packages inside the container
+    # Install OpenLiteSpeed and default packages inside the container
     install_packages "$CONTAINER_NAME" "$PACKAGES"
-    install_litespeed "$CONTAINER_NAME"
+    install_openlitespeed "$CONTAINER_NAME"
 
     # Configure firewall for the container port
     configure_firewall "$HOST_PORT"
@@ -416,7 +415,7 @@ create_container() {
 
     echo_success "Container setup complete."
     echo_info "You can access the container using the command: vroot enter --image-name $CONTAINER_NAME"
-    echo_info "LiteSpeed is accessible on host port: $HOST_PORT"
+    echo_info "OpenLiteSpeed is accessible on host port: $HOST_PORT"
 }
 
 # Function to check if a systemd service exists
@@ -430,20 +429,22 @@ systemd_service_exists() {
     fi
 }
 
-# Function to install LiteSpeed inside the container
-install_litespeed() {
+# Function to install OpenLiteSpeed inside the container
+install_openlitespeed() {
     local CONTAINER_NAME="$1"
 
-    echo_info "Installing LiteSpeed in container: $CONTAINER_NAME"
-    podman exec -u root "$CONTAINER_NAME" bash -c "dnf update -y && dnf install -y wget tar gcc make openssl"
+    echo_info "Installing OpenLiteSpeed in container: $CONTAINER_NAME"
 
-    # Download and install LiteSpeed
-    podman exec -u root "$CONTAINER_NAME" bash -c "wget -O install.sh $LITESPEED_INSTALL_SCRIPT_URL && chmod +x install.sh && ./install.sh"
+    podman exec -u root "$CONTAINER_NAME" bash -c "
+        dnf install -y epel-release
+        dnf install -y yum-utils
+        yum-config-manager --add-repo http://rpms.litespeedtech.com/centos/litespeed.repo
+        dnf install -y openlitespeed
+        systemctl enable lsws
+        systemctl start lsws
+    "
 
-    # Enable and start LiteSpeed service
-    podman exec -u root "$CONTAINER_NAME" bash -c "systemctl enable lsws && systemctl start lsws"
-
-    echo_success "LiteSpeed installed and started in container: $CONTAINER_NAME"
+    echo_success "OpenLiteSpeed installed and started in container: $CONTAINER_NAME"
 }
 
 # Function to install additional packages inside the container
@@ -678,7 +679,8 @@ is_systemd_service_present() {
 launch_ui() {
     while true; do
         local cmd
-        cmd=$(dialog --clear --backtitle "vroot UI" \
+        cmd=$(dialog --clear \
+            --backtitle "vroot UI" \
             --title "vroot - Podman Container Manager" \
             --menu "Choose an option:" 20 70 15 \
             1 "Create a new container" \
@@ -1038,7 +1040,7 @@ service_from_ui() {
         return
     fi
 
-    # Check if service exists; if not, create it
+    # Check if service exists; if not, prompt to create it
     if ! is_systemd_service_present "$SELECTED_CONTAINER"; then
         echo_warning "Systemd service for container $SELECTED_CONTAINER does not exist."
         read -p "Do you want to create it? (y/n): " CREATE_SERVICE
@@ -1239,7 +1241,7 @@ case "$SUBCOMMAND" in
                     ;;
                 -h|--help)
                     display_list_help
-                    exit 0
+                    exit 1
                     ;;
                 --)
                     shift
@@ -1282,7 +1284,7 @@ case "$SUBCOMMAND" in
                     ;;
                 -h|--help)
                     display_remove_help
-                    exit 1
+                    exit 0
                     ;;
                 --)
                     shift
@@ -1306,7 +1308,7 @@ case "$SUBCOMMAND" in
         ;;
     backup)
         # Parse options for backup
-        OPTIONS=$(getopt -o h --long help,all,running,stopped -n 'vroot backup' -- "$@")
+        OPTIONS=$(getopt -o h --long help,image-name:,backup-dir: -n 'vroot backup' -- "$@")
         if [ $? != 0 ]; then
             echo_error "Failed to parse backup options."
             display_backup_help
@@ -1330,7 +1332,7 @@ case "$SUBCOMMAND" in
                     ;;
                 -h|--help)
                     display_backup_help
-                    exit 0
+                    exit 1
                     ;;
                 --)
                     shift
@@ -1378,7 +1380,7 @@ case "$SUBCOMMAND" in
                     ;;
                 -h|--help)
                     display_restore_help
-                    exit 0
+                    exit 1
                     ;;
                 --)
                     shift
@@ -1424,7 +1426,7 @@ case "$SUBCOMMAND" in
                     ;;
                 -h|--help)
                     display_service_help
-                    exit 0
+                    exit 1
                     ;;
                 --)
                     shift
