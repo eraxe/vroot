@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # Variables
-VROOT_SCRIPT_URL="https://raw.githubusercontent.com/yourusername/vroot_repo/main/vroot.sh"  # Replace with actual URL
+VROOT_SCRIPT_URL="https://raw.githubusercontent.com/eraxe/vroot/main/vroot.sh"  # Replace with actual URL
 INSTALL_PATH="/usr/local/bin/vroot"
 CONFIG_DIR="$HOME/.config/vroot"
 CONFIG_FILE="$CONFIG_DIR/vroot_config"

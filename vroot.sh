@@ -7,7 +7,7 @@
 #              managing systemd services, backup & restore, and more.
 # Author: Arash Abolhasani 
 # Date: 2024-10-17
-# Version: 3.1.0
+# Version: 3.2.0
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -30,26 +30,32 @@ DEFAULT_PACKAGES=("git" "vim" "curl")
 DEFAULT_CPU="1"
 DEFAULT_MEMORY="512m"
 
+# Colors for UI
+COLOR_INFO="\e[34m[INFO]\e[0m"
+COLOR_SUCCESS="\e[32m[SUCCESS]\e[0m"
+COLOR_WARNING="\e[33m[WARNING]\e[0m"
+COLOR_ERROR="\e[31m[ERROR]\e[0m"
+
 # ------------------------------- Functions ------------------------------------
 
 # Function to display informational messages
 echo_info() {
-    echo -e "\e[34m[INFO]\e[0m $1"
+    echo -e "${COLOR_INFO} $1"
 }
 
 # Function to display success messages
 echo_success() {
-    echo -e "\e[32m[SUCCESS]\e[0m $1"
+    echo -e "${COLOR_SUCCESS} $1"
 }
 
 # Function to display warning messages
 echo_warning() {
-    echo -e "\e[33m[WARNING]\e[0m $1"
+    echo -e "${COLOR_WARNING} $1"
 }
 
 # Function to display error messages
 echo_error() {
-    echo -e "\e[31m[ERROR]\e[0m $1" >&2
+    echo -e "${COLOR_ERROR} $1" >&2
 }
 
 # Function to display help
@@ -138,6 +144,7 @@ Usage:
 Options:
       --all              List all containers including stopped ones
       --running          List only running containers
+      --stopped          List only stopped containers
       --help             Display this help message
 
 Examples:
@@ -402,12 +409,7 @@ create_container() {
 
     # Create systemd service if not exists
     if ! systemd_service_exists "$CONTAINER_NAME"; then
-        read -p "Do you want to create a systemd service for this container to start on boot? (y/n): " CREATE_SERVICE
-        if [[ "$CREATE_SERVICE" =~ ^[Yy]$ ]]; then
-            create_systemd_service "$CONTAINER_NAME"
-        else
-            echo_info "Skipping systemd service creation."
-        fi
+        create_systemd_service "$CONTAINER_NAME"
     else
         echo_warning "Systemd service for container $CONTAINER_NAME already exists."
     fi
@@ -533,7 +535,7 @@ configure_firewall() {
 
 # Function to list containers
 list_containers() {
-    local filter="$1" # "all", "running", or empty
+    local filter="$1" # "all", "running", "stopped"
 
     case "$filter" in
         all)
@@ -541,6 +543,9 @@ list_containers() {
             ;;
         running)
             podman ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+            ;;
+        stopped)
+            podman ps -a --filter "status=exited" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
             ;;
         *)
             podman ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
@@ -690,15 +695,16 @@ launch_ui() {
         local cmd
         cmd=$(dialog --clear --backtitle "vroot UI" \
             --title "vroot - Podman Container Manager" \
-            --menu "Choose an option:" 20 70 15 \
-            1 "Create a new container" \
-            2 "Enter an existing container" \
-            3 "List containers" \
-            4 "Remove a container" \
-            5 "Backup a container" \
-            6 "Restore a container" \
-            7 "Manage container service" \
-            8 "Exit" \
+            --colors \
+            --menu "\ZbChoose an option:\Zn" 20 70 15 \
+            1 "\Z1 Create a new container\Zn" \
+            2 "\Z1 Enter an existing container\Zn" \
+            3 "\Z1 List containers\Zn" \
+            4 "\Z1 Remove a container\Zn" \
+            5 "\Z1 Backup a container\Zn" \
+            6 "\Z1 Restore a container\Zn" \
+            7 "\Z1 Manage container service\Zn" \
+            8 "\Z1 Exit\Zn" \
             3>&1 1>&2 2>&3)
 
         clear
@@ -1014,7 +1020,7 @@ service_from_ui() {
             ;;
     esac
 
-    # Prompt for container name
+    # List all containers
     CONTAINERS_ALL=$(podman ps -a --format "{{.Names}}")
 
     if [ -z "$CONTAINERS_ALL" ]; then
@@ -1035,6 +1041,12 @@ service_from_ui() {
     if [ -z "$SELECTED_CONTAINER" ]; then
         echo_warning "No container selected."
         return
+    fi
+
+    # Check if service exists; if not, create it
+    if ! is_systemd_service_present "$SELECTED_CONTAINER"; then
+        echo_warning "Systemd service for container $SELECTED_CONTAINER does not exist."
+        create_systemd_service "$SELECTED_CONTAINER"
     fi
 
     manage_service "$ACTION_CMD" "$SELECTED_CONTAINER"
@@ -1061,6 +1073,12 @@ fi
 
 # Check dependencies
 check_dependencies
+
+# If no arguments are provided, launch UI
+if [ $# -eq 0 ]; then
+    launch_ui
+    exit 0
+fi
 
 # Parse subcommand
 SUBCOMMAND="$1"
@@ -1424,16 +1442,10 @@ case "$SUBCOMMAND" in
             exit 1
         fi
 
-        # Check if service exists; if not, prompt to create it
+        # Check if service exists; if not, create it
         if ! is_systemd_service_present "$SERVICE_IMAGE_NAME"; then
             echo_warning "Systemd service for container $SERVICE_IMAGE_NAME does not exist."
-            read -p "Do you want to create it? (y/n): " CREATE_SERVICE
-            if [[ "$CREATE_SERVICE" =~ ^[Yy]$ ]]; then
-                create_systemd_service "$SERVICE_IMAGE_NAME"
-            else
-                echo_info "Service management cancelled."
-                exit 0
-            fi
+            create_systemd_service "$SERVICE_IMAGE_NAME"
         fi
 
         manage_service "$SERVICE_SUBCOMMAND" "$SERVICE_IMAGE_NAME"
