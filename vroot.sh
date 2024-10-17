@@ -7,7 +7,7 @@
 #              managing systemd services, backup & restore, and more.
 # Author: Arash Abolhasani 
 # Date: 2024-10-17
-# Version: 3.2.0
+# Version: 3.3.0
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -30,7 +30,7 @@ DEFAULT_PACKAGES=("git" "vim" "curl")
 DEFAULT_CPU="1"
 DEFAULT_MEMORY="512m"
 
-# Colors for UI
+# Colors for echo functions
 COLOR_INFO="\e[34m[INFO]\e[0m"
 COLOR_SUCCESS="\e[32m[SUCCESS]\e[0m"
 COLOR_WARNING="\e[33m[WARNING]\e[0m"
@@ -86,8 +86,8 @@ Examples:
   # Create a new container with custom base image and port
   vroot create --base-image almalinux:9 --port 50000 --alias alma1
 
-  # Enter an existing container named 'almalinux_litespeed_20241017204318'
-  vroot enter --image-name almalinux_litespeed_20241017204318
+  # Enter an existing container named 'alma1'
+  vroot enter --image-name alma1
 
 HELP
 }
@@ -129,8 +129,8 @@ Options:
       --help             Display this help message
 
 Examples:
-  # Enter an existing container named 'almalinux_litespeed_20241017204318'
-  vroot enter --image-name almalinux_litespeed_20241017204318
+  # Enter an existing container named 'alma1'
+  vroot enter --image-name alma1
 
 HELP
 }
@@ -284,13 +284,10 @@ determine_shell_config() {
     esac
 }
 
-# Function to create a unique container name using alias and timestamp
+# Function to create a unique container name using alias
 generate_unique_name() {
     local alias_name="$1"
-    local timestamp
-    timestamp=$(date +"%Y%m%d%H%M%S")
-    local unique_name="${alias_name}_litespeed_${timestamp}"
-    echo "$unique_name"
+    echo "$alias_name"
 }
 
 # Function to determine the next available host port starting from DEFAULT_PORT
@@ -336,7 +333,7 @@ podman_container_exists() {
     fi
 }
 
-# Function to create a persistent Podman container with LiteSpeed and default packages
+# Function to create a Podman container with LiteSpeed and default packages
 create_container() {
     local BASE_IMAGE="$1"
     local HOST_PORT="$2"
@@ -345,6 +342,12 @@ create_container() {
     local PACKAGES="$5"
     local CPU_LIMIT="$6"
     local MEMORY_LIMIT="$7"
+
+    # Check if alias is already used
+    if podman_container_exists "$ALIAS_NAME"; then
+        echo_error "A container with alias '$ALIAS_NAME' already exists. Choose a different alias."
+        exit 1
+    fi
 
     # Validate HOST_PORT
     if [ -n "$HOST_PORT" ]; then
@@ -357,7 +360,7 @@ create_container() {
         fi
     fi
 
-    # Generate unique container name
+    # Generate container name (using alias)
     local CONTAINER_NAME
     CONTAINER_NAME=$(generate_unique_name "$ALIAS_NAME")
 
@@ -401,9 +404,6 @@ create_container() {
     install_packages "$CONTAINER_NAME" "$PACKAGES"
     install_litespeed "$CONTAINER_NAME"
 
-    # Commit the container to a new image to ensure persistence
-    commit_container "$CONTAINER_NAME"
-
     # Configure firewall for the container port
     configure_firewall "$HOST_PORT"
 
@@ -422,7 +422,7 @@ create_container() {
 # Function to check if a systemd service exists
 systemd_service_exists() {
     local CONTAINER_NAME="$1"
-    local SERVICE_FILE="/etc/systemd/system/podman-${CONTAINER_NAME}.service"
+    local SERVICE_FILE="/etc/systemd/system/pm-${CONTAINER_NAME}.service"
     if [ -f "$SERVICE_FILE" ]; then
         return 0
     else
@@ -435,7 +435,7 @@ install_litespeed() {
     local CONTAINER_NAME="$1"
 
     echo_info "Installing LiteSpeed in container: $CONTAINER_NAME"
-    podman exec -u root "$CONTAINER_NAME" bash -c "dnf update -y && dnf install -y wget tar gcc make openssl systemd"
+    podman exec -u root "$CONTAINER_NAME" bash -c "dnf update -y && dnf install -y wget tar gcc make openssl"
 
     # Download and install LiteSpeed
     podman exec -u root "$CONTAINER_NAME" bash -c "wget -O install.sh $LITESPEED_INSTALL_SCRIPT_URL && chmod +x install.sh && ./install.sh"
@@ -461,23 +461,6 @@ install_packages() {
     fi
 }
 
-# Function to commit the container to a new image for persistence
-commit_container() {
-    local CONTAINER_NAME="$1"
-    local COMMITTED_IMAGE="${CONTAINER_NAME}_image"
-
-    echo_info "Committing container $CONTAINER_NAME to image $COMMITTED_IMAGE"
-    podman commit "$CONTAINER_NAME" "$COMMITTED_IMAGE"
-
-    echo_success "Container $CONTAINER_NAME committed to image $COMMITTED_IMAGE"
-
-    # Stop and remove the original container
-    podman stop "$CONTAINER_NAME" &> /dev/null || true
-    podman rm "$CONTAINER_NAME" &> /dev/null || true
-
-    echo_info "Container $CONTAINER_NAME stopped and removed. Use the committed image $COMMITTED_IMAGE for running."
-}
-
 # Function to create a systemd service for the container
 create_systemd_service() {
     local CONTAINER_NAME="$1"
@@ -486,7 +469,8 @@ create_systemd_service() {
         return 1
     fi
 
-    local SERVICE_FILE="/etc/systemd/system/podman-${CONTAINER_NAME}.service"
+    local SERVICE_NAME="pm-${CONTAINER_NAME}.service"
+    local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 
     echo_info "Creating systemd service for container: $CONTAINER_NAME"
 
@@ -497,9 +481,8 @@ After=network.target
 
 [Service]
 Restart=always
-ExecStart=/usr/bin/podman run --name $CONTAINER_NAME -d -p 80:80 ${CONTAINER_NAME}_image
-ExecStop=/usr/bin/podman stop $CONTAINER_NAME
-ExecStopPost=/usr/bin/podman rm $CONTAINER_NAME
+ExecStart=/usr/bin/podman start -a $CONTAINER_NAME
+ExecStop=/usr/bin/podman stop -t 10 $CONTAINER_NAME
 
 [Install]
 WantedBy=multi-user.target
@@ -511,9 +494,9 @@ EOF
     fi
 
     sudo systemctl daemon-reload
-    if sudo systemctl enable "podman-${CONTAINER_NAME}.service"; then
+    if sudo systemctl enable "$SERVICE_NAME"; then
         echo_success "Systemd service enabled for container: $CONTAINER_NAME"
-        if sudo systemctl start "podman-${CONTAINER_NAME}.service"; then
+        if sudo systemctl start "$SERVICE_NAME"; then
             echo_success "Systemd service started for container: $CONTAINER_NAME"
         else
             echo_error "Failed to start systemd service for container: $CONTAINER_NAME"
@@ -583,11 +566,12 @@ remove_container() {
     echo_success "Container $CONTAINER_NAME removed."
 
     # Remove associated systemd service if exists
-    local SERVICE_FILE="/etc/systemd/system/podman-${CONTAINER_NAME}.service"
+    local SERVICE_NAME="pm-${CONTAINER_NAME}.service"
+    local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
     if [ -f "$SERVICE_FILE" ]; then
         echo_info "Removing systemd service for container: $CONTAINER_NAME"
-        sudo systemctl stop "podman-${CONTAINER_NAME}.service" &> /dev/null || true
-        sudo systemctl disable "podman-${CONTAINER_NAME}.service" &> /dev/null || true
+        sudo systemctl stop "$SERVICE_NAME" &> /dev/null || true
+        sudo systemctl disable "$SERVICE_NAME" &> /dev/null || true
         sudo rm -f "$SERVICE_FILE"
         sudo systemctl daemon-reload
         echo_success "Systemd service for container $CONTAINER_NAME removed."
@@ -648,7 +632,7 @@ manage_service() {
         exit 1
     fi
 
-    local SERVICE_NAME="podman-${CONTAINER_NAME}.service"
+    local SERVICE_NAME="pm-${CONTAINER_NAME}.service"
 
     case "$ACTION" in
         start)
@@ -681,7 +665,8 @@ manage_service() {
 # Function to check if a systemd service exists
 is_systemd_service_present() {
     local CONTAINER_NAME="$1"
-    local SERVICE_FILE="/etc/systemd/system/podman-${CONTAINER_NAME}.service"
+    local SERVICE_NAME="pm-${CONTAINER_NAME}.service"
+    local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
     if [ -f "$SERVICE_FILE" ]; then
         return 0
     else
@@ -695,16 +680,15 @@ launch_ui() {
         local cmd
         cmd=$(dialog --clear --backtitle "vroot UI" \
             --title "vroot - Podman Container Manager" \
-            --colors \
-            --menu "\ZbChoose an option:\Zn" 20 70 15 \
-            1 "\Z1 Create a new container\Zn" \
-            2 "\Z1 Enter an existing container\Zn" \
-            3 "\Z1 List containers\Zn" \
-            4 "\Z1 Remove a container\Zn" \
-            5 "\Z1 Backup a container\Zn" \
-            6 "\Z1 Restore a container\Zn" \
-            7 "\Z1 Manage container service\Zn" \
-            8 "\Z1 Exit\Zn" \
+            --menu "Choose an option:" 20 70 15 \
+            1 "Create a new container" \
+            2 "Enter an existing container" \
+            3 "List containers" \
+            4 "Remove a container" \
+            5 "Backup a container" \
+            6 "Restore a container" \
+            7 "Manage container service" \
+            8 "Exit" \
             3>&1 1>&2 2>&3)
 
         clear
@@ -863,21 +847,26 @@ list_from_ui() {
 
     case $choice in
         1)
-            list_containers "all"
+            CONTAINER_LIST=$(list_containers "all")
             ;;
         2)
-            list_containers "running"
+            CONTAINER_LIST=$(list_containers "running")
             ;;
         3)
-            list_containers "stopped"
+            CONTAINER_LIST=$(list_containers "stopped")
             ;;
         4)
             echo_info "Cancelled listing containers."
+            return
             ;;
         *)
             echo_error "Invalid option."
+            return
             ;;
     esac
+
+    # Display the container list in a scrollable box
+    dialog --title "Container List" --msgbox "$CONTAINER_LIST" 20 80
 }
 
 # Function to remove a container via UI
@@ -974,6 +963,12 @@ restore_from_ui() {
         return
     fi
 
+    # Check if container with the same name exists
+    if podman_container_exists "$CONTAINER_NAME"; then
+        echo_error "A container with name '$CONTAINER_NAME' already exists. Choose a different name."
+        return
+    fi
+
     # Prompt for backup file
     BACKUP_FILE=$(dialog --fselect "$HOME/backups/" 15 60 3>&1 1>&2 2>&3) || return
     if [ -z "$BACKUP_FILE" ]; then
@@ -1046,7 +1041,13 @@ service_from_ui() {
     # Check if service exists; if not, create it
     if ! is_systemd_service_present "$SELECTED_CONTAINER"; then
         echo_warning "Systemd service for container $SELECTED_CONTAINER does not exist."
-        create_systemd_service "$SELECTED_CONTAINER"
+        read -p "Do you want to create it? (y/n): " CREATE_SERVICE
+        if [[ "$CREATE_SERVICE" =~ ^[Yy]$ ]]; then
+            create_systemd_service "$SELECTED_CONTAINER"
+        else
+            echo_info "Service management cancelled."
+            return
+        fi
     fi
 
     manage_service "$ACTION_CMD" "$SELECTED_CONTAINER"
@@ -1252,7 +1253,8 @@ case "$SUBCOMMAND" in
             esac
         done
 
-        list_containers "$LIST_FILTER"
+        CONTAINER_LIST=$(list_containers "$LIST_FILTER")
+        dialog --title "Container List" --msgbox "$CONTAINER_LIST" 20 80
         ;;
     remove)
         # Parse options for remove
@@ -1280,7 +1282,7 @@ case "$SUBCOMMAND" in
                     ;;
                 -h|--help)
                     display_remove_help
-                    exit 0
+                    exit 1
                     ;;
                 --)
                     shift
@@ -1304,7 +1306,7 @@ case "$SUBCOMMAND" in
         ;;
     backup)
         # Parse options for backup
-        OPTIONS=$(getopt -o h --long help,image-name:,backup-dir: -n 'vroot backup' -- "$@")
+        OPTIONS=$(getopt -o h --long help,all,running,stopped -n 'vroot backup' -- "$@")
         if [ $? != 0 ]; then
             echo_error "Failed to parse backup options."
             display_backup_help
@@ -1442,10 +1444,16 @@ case "$SUBCOMMAND" in
             exit 1
         fi
 
-        # Check if service exists; if not, create it
+        # Check if service exists; if not, prompt to create it
         if ! is_systemd_service_present "$SERVICE_IMAGE_NAME"; then
             echo_warning "Systemd service for container $SERVICE_IMAGE_NAME does not exist."
-            create_systemd_service "$SERVICE_IMAGE_NAME"
+            read -p "Do you want to create it? (y/n): " CREATE_SERVICE
+            if [[ "$CREATE_SERVICE" =~ ^[Yy]$ ]]; then
+                create_systemd_service "$SERVICE_IMAGE_NAME"
+            else
+                echo_info "Service management cancelled."
+                exit 0
+            fi
         fi
 
         manage_service "$SERVICE_SUBCOMMAND" "$SERVICE_IMAGE_NAME"
