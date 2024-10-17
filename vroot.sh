@@ -6,8 +6,8 @@
 #              OpenLiteSpeed. Supports creating, entering, listing, removing containers,
 #              managing systemd services, backup & restore, and more.
 # Author: Arash Abolhasani 
-# Date: 2024-10-17
-# Version: 3.4.0
+# Date: 2024-10-18
+# Version: 3.4.1
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -25,11 +25,17 @@ CONFIG_FILE="$HOME/.vroot_config"
 # Additional packages to install by default
 DEFAULT_PACKAGES=("git" "vim" "curl")
 
+# List of available repositories to add
+AVAILABLE_REPOS=("epel" "remi")  # Add more repositories as needed
+
+# List of common packages
+COMMON_PACKAGES=("git" "vim" "curl" "htop" "nano" "wget" "net-tools" "gcc" "make" "openssl")
+
 # Resource limits
 DEFAULT_CPU="1"
 DEFAULT_MEMORY="512m"
 
-# Colors for echo functions (removed for UI enhancement)
+# Colors for echo functions
 COLOR_INFO="[INFO]"
 COLOR_SUCCESS="[SUCCESS]"
 COLOR_WARNING="[WARNING]"
@@ -105,14 +111,15 @@ Options:
       --packages         Comma-separated list of packages to install (default: git,vim,curl)
       --cpu              CPU limit for the container (default: 1)
       --memory           Memory limit for the container (default: 512m)
+      --repos            Comma-separated list of repositories to add (available: epel, remi)
       --help             Display this help message
 
 Examples:
   # Create a new container with default settings
   vroot create
 
-  # Create a new container with custom base image and port
-  vroot create --base-image almalinux:9 --port 50000 --alias alma1 --packages git,vim,htop --cpu 2 --memory 1g
+  # Create a new container with custom base image, port, and repositories
+  vroot create --base-image almalinux:9 --port 50000 --alias alma1 --packages git,vim,htop --cpu 2 --memory 1g --repos epel,remi
 
 HELP
 }
@@ -238,7 +245,7 @@ HELP
 
 # Function to check dependencies
 check_dependencies() {
-    local dependencies=(podman dialog lsof systemctl wget tar gcc make openssl firewall-cmd)
+    local dependencies=(podman dialog lsof ss systemctl wget tar gcc make openssl firewall-cmd)
     local missing=()
 
     for cmd in "${dependencies[@]}"; do
@@ -301,7 +308,7 @@ get_next_available_port() {
         fi
     done
 
-    while lsof -i ":$port" &> /dev/null; do
+    while ss -tuln | grep -q ":$port "; do
         echo_info "Port $port is in use. Checking next port."
         port=$((port + 1))
         if [ "$port" -gt 65535 ]; then
@@ -341,6 +348,7 @@ create_container() {
     local PACKAGES="$5"
     local CPU_LIMIT="$6"
     local MEMORY_LIMIT="$7"
+    local REPOS="$8"
 
     # Check if alias is already used
     if podman_container_exists "$ALIAS_NAME"; then
@@ -399,8 +407,30 @@ create_container() {
 
     echo_success "Container $CONTAINER_NAME created and started on host port $HOST_PORT."
 
-    # Install OpenLiteSpeed and default packages inside the container
+    # Install selected repositories inside the container
+    if [ -n "$REPOS" ]; then
+        IFS=',' read -ra REPO_ARRAY <<< "$REPOS"
+        for repo in "${REPO_ARRAY[@]}"; do
+            case "$repo" in
+                epel)
+                    echo_info "Installing EPEL repository in container: $CONTAINER_NAME"
+                    podman exec -u root "$CONTAINER_NAME" dnf install -y epel-release
+                    ;;
+                remi)
+                    echo_info "Installing Remi repository in container: $CONTAINER_NAME"
+                    podman exec -u root "$CONTAINER_NAME" dnf install -y https://rpms.remirepo.net/enterprise/remi-release-9.rpm
+                    ;;
+                *)
+                    echo_warning "Unknown repository: $repo. Skipping."
+                    ;;
+            esac
+        done
+    fi
+
+    # Install additional packages inside the container
     install_packages "$CONTAINER_NAME" "$PACKAGES"
+
+    # Install OpenLiteSpeed
     install_openlitespeed "$CONTAINER_NAME"
 
     # Configure firewall for the container port
@@ -436,13 +466,30 @@ install_openlitespeed() {
     echo_info "Installing OpenLiteSpeed in container: $CONTAINER_NAME"
 
     podman exec -u root "$CONTAINER_NAME" bash -c "
+        set -e
         dnf install -y epel-release
-        dnf install -y yum-utils
+        dnf install -y yum-utils gcc make wget tar
         yum-config-manager --add-repo http://rpms.litespeedtech.com/centos/litespeed.repo
+        # Install oniguruma from source to get libonig.so.105
+        wget https://github.com/kkos/oniguruma/releases/download/v6.9.5/oniguruma-6.9.5.tar.gz
+        tar zxvf oniguruma-6.9.5.tar.gz
+        cd oniguruma-6.9.5
+        ./configure --prefix=/usr/local
+        make
+        make install
+        ldconfig
+        # Install OpenLiteSpeed
         dnf install -y openlitespeed
+        # Enable and start OpenLiteSpeed
         systemctl enable lsws
         systemctl start lsws
     "
+
+    # Verify if OpenLiteSpeed service exists
+    podman exec -u root "$CONTAINER_NAME" bash -c "systemctl is-enabled lsws" &> /dev/null
+    if [ $? -ne 0 ]; then
+        echo_error "Failed to enable lsws service in container: $CONTAINER_NAME"
+    fi
 
     echo_success "OpenLiteSpeed installed and started in container: $CONTAINER_NAME"
 }
@@ -455,7 +502,7 @@ install_packages() {
     if [ -n "$PACKAGES" ]; then
         IFS=',' read -ra PKG_ARRAY <<< "$PACKAGES"
         echo_info "Installing additional packages in container: $CONTAINER_NAME"
-        podman exec -u root "$CONTAINER_NAME" bash -c "dnf install -y ${PKG_ARRAY[*]}"
+        podman exec -u root "$CONTAINER_NAME" dnf install -y "${PKG_ARRAY[@]}"
         echo_success "Installed packages: ${PKG_ARRAY[*]} in container: $CONTAINER_NAME"
     else
         echo_warning "No additional packages specified for container: $CONTAINER_NAME"
@@ -728,69 +775,245 @@ launch_ui() {
     done
 }
 
-# Function to create a container via UI
+# Function to create a container via UI with step-by-step navigation
 create_from_ui() {
-    # Prompt for base image
-    BASE_IMAGE=$(dialog --inputbox "Enter base image:" 8 40 "$DEFAULT_BASE_IMAGE" 3>&1 1>&2 2>&3) || return
-    if [ -z "$BASE_IMAGE" ]; then
-        echo_warning "Base image not provided. Using default: $DEFAULT_BASE_IMAGE"
-        BASE_IMAGE="$DEFAULT_BASE_IMAGE"
-    fi
+    local BASE_IMAGE="$DEFAULT_BASE_IMAGE"
+    local HOST_PORT="$DEFAULT_PORT"
+    local CONTAINER_DIR="$DEFAULT_DATA_DIR"
+    local ALIAS_NAME="$DEFAULT_ALIAS"
+    local PACKAGES="${DEFAULT_PACKAGES[*]}"
+    local CPU_LIMIT="$DEFAULT_CPU"
+    local MEMORY_LIMIT="$DEFAULT_MEMORY"
+    local REPOS=""
 
-    # Prompt for port
-    HOST_PORT=$(dialog --inputbox "Enter host port (leave empty for auto):" 8 40 "" 3>&1 1>&2 2>&3) || HOST_PORT=""
-    if [ -n "$HOST_PORT" ]; then
-        if ! [[ "$HOST_PORT" =~ ^[0-9]+$ ]] || [ "$HOST_PORT" -lt 1 ] || [ "$HOST_PORT" -gt 65535 ]; then
-            echo_warning "Invalid port. Using default or auto-assigned port."
-            HOST_PORT=""
-        fi
-    fi
+    while true; do
+        local step=$(dialog --clear \
+            --backtitle "vroot UI - Create Container" \
+            --title "Step 1: Base Image" \
+            --inputbox "Enter base image:" 8 40 "$BASE_IMAGE" 3>&1 1>&2 2>&3)
 
-    # Prompt for data directory
-    CONTAINER_DIR=$(dialog --dselect "$DEFAULT_DATA_DIR" 10 50 3>&1 1>&2 2>&3) || CONTAINER_DIR="$DEFAULT_DATA_DIR"
-    if [ -z "$CONTAINER_DIR" ]; then
-        echo_warning "Directory not selected. Using default: $DEFAULT_DATA_DIR"
-        CONTAINER_DIR="$DEFAULT_DATA_DIR"
-    fi
-
-    # Confirm directory exists or create it
-    if [ ! -d "$CONTAINER_DIR" ]; then
-        read -p "Directory $CONTAINER_DIR does not exist. Create it? (y/n): " CREATE_DIR
-        if [[ "$CREATE_DIR" =~ ^[Yy]$ ]]; then
-            mkdir -p "$CONTAINER_DIR"
-            echo_info "Created directory: $CONTAINER_DIR"
-        else
-            echo_error "Directory selection is mandatory."
+        if [ $? -ne 0 ]; then
             return
         fi
-    fi
 
-    # Prompt for alias name
-    ALIAS_NAME=$(dialog --inputbox "Enter alias name:" 8 40 "$DEFAULT_ALIAS" 3>&1 1>&2 2>&3) || ALIAS_NAME="$DEFAULT_ALIAS"
-    if [ -z "$ALIAS_NAME" ]; then
-        echo_warning "Alias name not provided. Using default: $DEFAULT_ALIAS"
-        ALIAS_NAME="$DEFAULT_ALIAS"
-    fi
+        if [ -n "$step" ]; then
+            BASE_IMAGE="$step"
+        else
+            echo_warning "Base image not provided. Using default: $DEFAULT_BASE_IMAGE"
+            BASE_IMAGE="$DEFAULT_BASE_IMAGE"
+        fi
 
-    # Prompt for additional packages
-    PACKAGES=$(dialog --inputbox "Enter comma-separated packages to install (optional):" 8 60 "" 3>&1 1>&2 2>&3) || PACKAGES=""
-    PACKAGES="${PACKAGES// /}" # Remove spaces
+        break
+    done
 
-    # Prompt for CPU limit
-    CPU_LIMIT=$(dialog --inputbox "Enter CPU limit (default: $DEFAULT_CPU):" 8 40 "$DEFAULT_CPU" 3>&1 1>&2 2>&3) || CPU_LIMIT="$DEFAULT_CPU"
-    if ! [[ "$CPU_LIMIT" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        echo_warning "Invalid CPU limit. Using default: $DEFAULT_CPU"
-        CPU_LIMIT="$DEFAULT_CPU"
-    fi
+    while true; do
+        local step=$(dialog --clear \
+            --backtitle "vroot UI - Create Container" \
+            --title "Step 2: Add Repositories" \
+            --checklist "Select repositories to add (use SPACE to select, ENTER to confirm):" 15 50 5 \
+            1 "epel" "Extra Packages for Enterprise Linux" off \
+            2 "remi" "Remi's RPM repository" off \
+            3>&1 1>&2 2>&3)
 
-    # Prompt for Memory limit
-    MEMORY_LIMIT=$(dialog --inputbox "Enter Memory limit (e.g., 512m, 1g) (default: $DEFAULT_MEMORY):" 8 40 "$DEFAULT_MEMORY" 3>&1 1>&2 2>&3) || MEMORY_LIMIT="$DEFAULT_MEMORY"
-    if ! [[ "$MEMORY_LIMIT" =~ ^[0-9]+[mMgG]$ ]]; then
-        echo_warning "Invalid Memory limit. Using default: $DEFAULT_MEMORY"
-        MEMORY_LIMIT="$DEFAULT_MEMORY"
-    fi
+        if [ $? -ne 0 ]; then
+            return
+        fi
 
-    create_container "$BASE_IMAGE" "$HOST_PORT" "$CONTAINER_DIR" "$ALIAS_NAME" "$PACKAGES" "$CPU_LIMIT" "$MEMORY_LIMIT"
+        if [ -n "$step" ]; then
+            REPOS=$(echo "$step" | tr -d '"')
+        else
+            REPOS=""
+        fi
+
+        break
+    done
+
+    while true; do
+        local step=$(dialog --clear \
+            --backtitle "vroot UI - Create Container" \
+            --title "Step 3: Host Port" \
+            --inputbox "Enter host port (leave empty for auto-assigned port):" 8 40 "" 3>&1 1>&2 2>&3)
+
+        if [ $? -ne 0 ]; then
+            return
+        fi
+
+        if [ -n "$step" ]; then
+            if ! [[ "$step" =~ ^[0-9]+$ ]] || [ "$step" -lt 1 ] || [ "$step" -gt 65535 ]; then
+                dialog --msgbox "Invalid port number. Please enter a number between 1 and 65535." 6 50
+                continue
+            fi
+            HOST_PORT="$step"
+        else
+            HOST_PORT=""
+        fi
+
+        break
+    done
+
+    while true; do
+        local step=$(dialog --clear \
+            --backtitle "vroot UI - Create Container" \
+            --title "Step 4: Data Directory" \
+            --dselect "$DEFAULT_DATA_DIR" 10 50 3>&1 1>&2 2>&3)
+
+        if [ $? -ne 0 ]; then
+            return
+        fi
+
+        if [ -n "$step" ]; then
+            CONTAINER_DIR="$step"
+        else
+            echo_warning "Directory not selected. Using default: $DEFAULT_DATA_DIR"
+            CONTAINER_DIR="$DEFAULT_DATA_DIR"
+        fi
+
+        # Confirm directory exists or create it
+        if [ ! -d "$CONTAINER_DIR" ]; then
+            local confirm=$(dialog --clear \
+                --backtitle "vroot UI - Create Container" \
+                --title "Create Directory" \
+                --yesno "Directory $CONTAINER_DIR does not exist. Create it?" 7 60)
+            case $? in
+                0)
+                    mkdir -p "$CONTAINER_DIR"
+                    echo_info "Created directory: $CONTAINER_DIR"
+                    ;;
+                1)
+                    echo_error "Directory selection is mandatory."
+                    ;;
+                255)
+                    return
+                    ;;
+            esac
+        fi
+
+        break
+    done
+
+    while true; do
+        local step=$(dialog --clear \
+            --backtitle "vroot UI - Create Container" \
+            --title "Step 5: Alias Name" \
+            --inputbox "Enter alias name:" 8 40 "$DEFAULT_ALIAS" 3>&1 1>&2 2>&3)
+
+        if [ $? -ne 0 ]; then
+            return
+        fi
+
+        if [ -n "$step" ]; then
+            ALIAS_NAME="$step"
+        else
+            echo_warning "Alias name not provided. Using default: $DEFAULT_ALIAS"
+            ALIAS_NAME="$DEFAULT_ALIAS"
+        fi
+
+        break
+    done
+
+    while true; do
+        local step=$(dialog --clear \
+            --backtitle "vroot UI - Create Container" \
+            --title "Step 6: Select Packages" \
+            --checklist "Select packages to install (use SPACE to select, ENTER to confirm):" 15 50 10 \
+            1 "git" off \
+            2 "vim" off \
+            3 "curl" off \
+            4 "htop" off \
+            5 "nano" off \
+            6 "wget" off \
+            7 "net-tools" off \
+            8 "gcc" off \
+            9 "make" off \
+            10 "openssl" off \
+            3>&1 1>&2 2>&3)
+
+        if [ $? -ne 0 ]; then
+            return
+        fi
+
+        if [ -n "$step" ]; then
+            PACKAGES=$(echo "$step" | tr -d '"' | tr ' ' ',')
+        else
+            PACKAGES=""
+        fi
+
+        break
+    done
+
+    while true; do
+        local step=$(dialog --clear \
+            --backtitle "vroot UI - Create Container" \
+            --title "Step 7: CPU Limit" \
+            --inputbox "Enter CPU limit (default: $DEFAULT_CPU):" 8 40 "$DEFAULT_CPU" 3>&1 1>&2 2>&3)
+
+        if [ $? -ne 0 ]; then
+            return
+        fi
+
+        if [ -n "$step" ]; then
+            if ! [[ "$step" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                dialog --msgbox "Invalid CPU limit. Please enter a numeric value." 6 50
+                continue
+            fi
+            CPU_LIMIT="$step"
+        else
+            CPU_LIMIT="$DEFAULT_CPU"
+        fi
+
+        break
+    done
+
+    while true; do
+        local step=$(dialog --clear \
+            --backtitle "vroot UI - Create Container" \
+            --title "Step 8: Memory Limit" \
+            --inputbox "Enter Memory limit (e.g., 512m, 1g) (default: $DEFAULT_MEMORY):" 8 40 "$DEFAULT_MEMORY" 3>&1 1>&2 2>&3)
+
+        if [ $? -ne 0 ]; then
+            return
+        fi
+
+        if [ -n "$step" ]; then
+            if ! [[ "$step" =~ ^[0-9]+[mMgG]$ ]]; then
+                dialog --msgbox "Invalid Memory limit. Please enter a value like 512m or 1g." 6 60
+                continue
+            fi
+            MEMORY_LIMIT="$step"
+        else
+            MEMORY_LIMIT="$DEFAULT_MEMORY"
+        fi
+
+        break
+    done
+
+    # Confirm creation
+    dialog --clear \
+        --backtitle "vroot UI - Create Container" \
+        --title "Confirm" \
+        --yesno "Create container with the following settings?
+
+Base Image: $BASE_IMAGE
+Repositories: ${REPOS:-None}
+Host Port: ${HOST_PORT:-Auto-assigned}
+Data Directory: $CONTAINER_DIR
+Alias Name: $ALIAS_NAME
+Packages: ${PACKAGES:-None}
+CPU Limit: $CPU_LIMIT
+Memory Limit: $MEMORY_LIMIT" 15 60
+
+    case $? in
+        0)
+            create_container "$BASE_IMAGE" "$HOST_PORT" "$CONTAINER_DIR" "$ALIAS_NAME" "$PACKAGES" "$CPU_LIMIT" "$MEMORY_LIMIT" "$REPOS"
+            ;;
+        1)
+            echo_info "Container creation cancelled."
+            return
+            ;;
+        255)
+            return
+            ;;
+    esac
 }
 
 # Function to enter a container via UI
@@ -807,7 +1030,8 @@ enter_from_ui() {
     MENU_OPTIONS=()
     while IFS= read -r container; do
         STATUS=$(podman inspect -f '{{.State.Status}}' "$container")
-        MENU_OPTIONS+=("$container" "$STATUS")
+        PORT=$(podman port "$container" 80/tcp | awk -F: '{print $2}' | tr -d '\n')
+        MENU_OPTIONS+=("$container" "Status: $STATUS | Port: $PORT")
     done <<< "$CONTAINERS_ALL"
 
     SELECTED_CONTAINER=$(dialog --menu "Select a container to enter:" 20 60 15 "${MENU_OPTIONS[@]}" 3>&1 1>&2 2>&3) || return
@@ -896,17 +1120,37 @@ remove_from_ui() {
         return
     fi
 
-    read -p "Are you sure you want to remove container '$SELECTED_CONTAINER'? (y/n): " CONFIRM
-    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-        read -p "Force removal? (y/n): " FORCE_CONFIRM
-        if [[ "$FORCE_CONFIRM" =~ ^[Yy]$ ]]; then
-            remove_container "$SELECTED_CONTAINER" "true"
-        else
-            remove_container "$SELECTED_CONTAINER" "false"
-        fi
-    else
-        echo_info "Container removal cancelled."
-    fi
+    local confirm=$(dialog --clear \
+        --backtitle "vroot UI - Remove Container" \
+        --title "Confirm Removal" \
+        --yesno "Are you sure you want to remove container '$SELECTED_CONTAINER'?" 7 60)
+
+    case $? in
+        0)
+            local force_confirm=$(dialog --clear \
+                --backtitle "vroot UI - Remove Container" \
+                --title "Force Removal" \
+                --yesno "Force removal? (This will stop the container if it's running)" 7 60)
+            case $? in
+                0)
+                    remove_container "$SELECTED_CONTAINER" "true"
+                    ;;
+                1)
+                    remove_container "$SELECTED_CONTAINER" "false"
+                    ;;
+                255)
+                    return
+                    ;;
+            esac
+            ;;
+        1)
+            echo_info "Container removal cancelled."
+            return
+            ;;
+        255)
+            return
+            ;;
+    esac
 }
 
 # Function to backup a container via UI
@@ -935,7 +1179,10 @@ backup_from_ui() {
     fi
 
     # Prompt for backup directory
-    BACKUP_DIR=$(dialog --dselect "$HOME/backups" 10 50 3>&1 1>&2 2>&3) || BACKUP_DIR="$HOME/backups"
+    BACKUP_DIR=$(dialog --clear \
+        --backtitle "vroot UI - Backup Container" \
+        --title "Select Backup Directory" \
+        --dselect "$HOME/backups" 10 50 3>&1 1>&2 2>&3) || BACKUP_DIR="$HOME/backups"
     if [ -z "$BACKUP_DIR" ]; then
         echo_warning "Backup directory not selected. Using default: $HOME/backups"
         BACKUP_DIR="$HOME/backups"
@@ -943,16 +1190,26 @@ backup_from_ui() {
 
     # Confirm directory exists or create it
     if [ ! -d "$BACKUP_DIR" ]; then
-        read -p "Directory $BACKUP_DIR does not exist. Create it? (y/n): " CREATE_DIR
-        if [[ "$CREATE_DIR" =~ ^[Yy]$ ]]; then
-            mkdir -p "$BACKUP_DIR"
-            echo_info "Created directory: $BACKUP_DIR"
-        else
-            echo_error "Backup directory selection is mandatory."
-            return
-        fi
+        local confirm=$(dialog --clear \
+            --backtitle "vroot UI - Backup Container" \
+            --title "Create Backup Directory" \
+            --yesno "Directory $BACKUP_DIR does not exist. Create it?" 7 60)
+        case $? in
+            0)
+                mkdir -p "$BACKUP_DIR"
+                echo_info "Created directory: $BACKUP_DIR"
+                ;;
+            1)
+                echo_error "Backup directory selection is mandatory."
+                return
+                ;;
+            255)
+                return
+                ;;
+        esac
     fi
 
+    # Perform backup
     backup_container "$SELECTED_CONTAINER" "$BACKUP_DIR"
 }
 
@@ -972,19 +1229,42 @@ restore_from_ui() {
     fi
 
     # Prompt for backup file
-    BACKUP_FILE=$(dialog --fselect "$HOME/backups/" 15 60 3>&1 1>&2 2>&3) || return
+    BACKUP_FILE=$(dialog --clear \
+        --backtitle "vroot UI - Restore Container" \
+        --title "Select Backup File" \
+        --fselect "$HOME/backups/" 15 60 3>&1 1>&2 2>&3) || return
     if [ -z "$BACKUP_FILE" ]; then
         echo_error "Backup file is required for restoration."
         return
     fi
 
-    restore_container "$CONTAINER_NAME" "$BACKUP_FILE"
+    # Confirm restoration
+    dialog --clear \
+        --backtitle "vroot UI - Restore Container" \
+        --title "Confirm Restoration" \
+        --yesno "Restore container '$CONTAINER_NAME' from backup file '$BACKUP_FILE'?" 7 60
+
+    case $? in
+        0)
+            restore_container "$CONTAINER_NAME" "$BACKUP_FILE"
+            ;;
+        1)
+            echo_info "Container restoration cancelled."
+            return
+            ;;
+        255)
+            return
+            ;;
+    esac
 }
 
 # Function to manage services via UI
 service_from_ui() {
     # Prompt for subcommand
-    ACTION=$(dialog --menu "Select service action:" 15 50 4 \
+    ACTION=$(dialog --clear \
+        --backtitle "vroot UI - Manage Service" \
+        --title "Service Actions" \
+        --menu "Select a service action:" 15 50 4 \
         1 "Start Service" \
         2 "Stop Service" \
         3 "Restart Service" \
@@ -1043,13 +1323,22 @@ service_from_ui() {
     # Check if service exists; if not, prompt to create it
     if ! is_systemd_service_present "$SELECTED_CONTAINER"; then
         echo_warning "Systemd service for container $SELECTED_CONTAINER does not exist."
-        read -p "Do you want to create it? (y/n): " CREATE_SERVICE
-        if [[ "$CREATE_SERVICE" =~ ^[Yy]$ ]]; then
-            create_systemd_service "$SELECTED_CONTAINER"
-        else
-            echo_info "Service management cancelled."
-            return
-        fi
+        local create_service=$(dialog --clear \
+            --backtitle "vroot UI - Manage Service" \
+            --title "Create Service" \
+            --yesno "Systemd service for container '$SELECTED_CONTAINER' does not exist. Create it?" 7 60)
+        case $? in
+            0)
+                create_systemd_service "$SELECTED_CONTAINER"
+                ;;
+            1)
+                echo_info "Service management cancelled."
+                return
+                ;;
+            255)
+                return
+                ;;
+        esac
     fi
 
     manage_service "$ACTION_CMD" "$SELECTED_CONTAINER"
@@ -1090,7 +1379,7 @@ shift
 case "$SUBCOMMAND" in
     create)
         # Parse options for create
-        OPTIONS=$(getopt -o h --long help,base-image:,port:,dir:,alias:,packages:,cpu:,memory: -n 'vroot create' -- "$@")
+        OPTIONS=$(getopt -o h --long help,base-image:,port:,dir:,alias:,packages:,cpu:,memory:,repos: -n 'vroot create' -- "$@")
         if [ $? != 0 ]; then
             echo_error "Failed to parse create options."
             display_create_help
@@ -1107,6 +1396,7 @@ case "$SUBCOMMAND" in
         CREATE_PACKAGES="$(IFS=,; echo "${DEFAULT_PACKAGES[*]}")"
         CREATE_CPU="$DEFAULT_CPU"
         CREATE_MEMORY="$DEFAULT_MEMORY"
+        CREATE_REPOS=""
 
         while true; do
             case "$1" in
@@ -1138,6 +1428,10 @@ case "$SUBCOMMAND" in
                     CREATE_MEMORY="$2"
                     shift 2
                     ;;
+                --repos)
+                    CREATE_REPOS="$2"
+                    shift 2
+                    ;;
                 -h|--help)
                     display_create_help
                     exit 0
@@ -1154,7 +1448,7 @@ case "$SUBCOMMAND" in
             esac
         done
 
-        create_container "$CREATE_BASE_IMAGE" "$CREATE_PORT" "$CREATE_DIR" "$CREATE_ALIAS" "$CREATE_PACKAGES" "$CREATE_CPU" "$CREATE_MEMORY"
+        create_container "$CREATE_BASE_IMAGE" "$CREATE_PORT" "$CREATE_DIR" "$CREATE_ALIAS" "$CREATE_PACKAGES" "$CREATE_CPU" "$CREATE_MEMORY" "$CREATE_REPOS"
         ;;
     enter)
         # Parse options for enter
@@ -1241,7 +1535,7 @@ case "$SUBCOMMAND" in
                     ;;
                 -h|--help)
                     display_list_help
-                    exit 1
+                    exit 0
                     ;;
                 --)
                     shift
@@ -1332,7 +1626,7 @@ case "$SUBCOMMAND" in
                     ;;
                 -h|--help)
                     display_backup_help
-                    exit 1
+                    exit 0
                     ;;
                 --)
                     shift
@@ -1426,7 +1720,7 @@ case "$SUBCOMMAND" in
                     ;;
                 -h|--help)
                     display_service_help
-                    exit 1
+                    exit 0
                     ;;
                 --)
                     shift
